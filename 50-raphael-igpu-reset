@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly config=/etc/raphael-igpu-reset.conf
+[[ -r $config ]] || exit 0
+
+# shellcheck source=/dev/null
+source "$config"
+
+readonly guest_name=${1:-}
+readonly operation=${2:-}
+readonly sub_operation=${3:-}
+
+if [[ $guest_name == "${VM_NAME:-}" && $operation == prepare && $sub_operation == begin ]]; then
+  exec /usr/local/libexec/raphael-igpu-reset/reseed
+fi
+
+exit 0

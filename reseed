@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly config=/etc/raphael-igpu-reset.conf
+readonly log_dir=/var/log/raphael-igpu-reset
+readonly lock_file=/run/lock/raphael-igpu-reset.lock
+
+if [[ $EUID -ne 0 ]]; then
+  echo "This helper must run as root." >&2
+  exit 2
+fi
+
+if [[ ! -r $config ]]; then
+  echo "Missing configuration: $config" >&2
+  exit 1
+fi
+
+# The configuration is installed root-owned and is not writable by users.
+# shellcheck source=/dev/null
+source "$config"
+
+: "${GPU_BDF:?GPU_BDF is required}"
+: "${SETTLE_SECONDS:=10}"
+: "${AUDIO_BDF:=}"
+: "${EXPECTED_GPU_ID:=1002:164e}"
+: "${EXPECTED_AUDIO_ID:=1002:1640}"
+
+readonly bdf_pattern='^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[0-7]$'
+if [[ ! $GPU_BDF =~ $bdf_pattern ]]; then
+  echo "Invalid GPU_BDF: $GPU_BDF" >&2
+  exit 1
+fi
+if [[ -n $AUDIO_BDF && ! $AUDIO_BDF =~ $bdf_pattern ]]; then
+  echo "Invalid AUDIO_BDF: $AUDIO_BDF" >&2
+  exit 1
+fi
+if [[ ! $SETTLE_SECONDS =~ ^[0-9]+$ ]] || (( SETTLE_SECONDS < 1 || SETTLE_SECONDS > 60 )); then
+  echo "SETTLE_SECONDS must be an integer from 1 to 60." >&2
+  exit 1
+fi
+
+readonly device=/sys/bus/pci/devices/$GPU_BDF
+readonly audio_device=${AUDIO_BDF:+/sys/bus/pci/devices/$AUDIO_BDF}
+
+driver_name() {
+  local target=$1
+  if [[ -L $target/driver ]]; then
+    basename "$(readlink -f "$target/driver")"
+  else
+    echo none
+  fi
+}
+
+pci_id() {
+  local target=$1
+  local vendor device_id
+  vendor=$(<"$target/vendor")
+  device_id=$(<"$target/device")
+  printf '%s:%s\n' "${vendor#0x}" "${device_id#0x}"
+}
+
+if [[ ! -e $device ]]; then
+  echo "GPU $GPU_BDF was not found in sysfs." >&2
+  exit 1
+fi
+if [[ -n $audio_device && ! -e $audio_device ]]; then
+  echo "Audio device $AUDIO_BDF was not found in sysfs." >&2
+  exit 1
+fi
+
+gpu_id=$(pci_id "$device")
+if [[ ${gpu_id,,} != ${EXPECTED_GPU_ID,,} ]]; then
+  echo "Unsupported GPU at $GPU_BDF: $gpu_id (expected $EXPECTED_GPU_ID)." >&2
+  exit 1
+fi
+if [[ -n $audio_device ]]; then
+  audio_id=$(pci_id "$audio_device")
+  if [[ ${audio_id,,} != ${EXPECTED_AUDIO_ID,,} ]]; then
+    echo "Unexpected audio device at $AUDIO_BDF: $audio_id (expected $EXPECTED_AUDIO_ID)." >&2
+    exit 1
+  fi
+fi
+
+gpu_driver=$(driver_name "$device")
+audio_driver=not-configured
+if [[ -n $audio_device ]]; then
+  audio_driver=$(driver_name "$audio_device")
+fi
+
+# Validate before installing the rollback trap. If this precondition fails,
+# the script must never steal a host GPU from its current driver.
+if [[ $gpu_driver != vfio-pci ]]; then
+  echo "Unsafe initial state: $GPU_BDF uses $gpu_driver, not vfio-pci." >&2
+  exit 1
+fi
+if [[ -n $audio_device && $audio_driver != vfio-pci ]]; then
+  echo "Unsafe initial state: $AUDIO_BDF uses $audio_driver, not vfio-pci." >&2
+  exit 1
+fi
+
+install -d -m 0755 "$log_dir"
+readonly log_file=$log_dir/hook-$(date +%Y%m%d-%H%M%S).log
+exec 9>"$lock_file"
+if ! flock -n 9; then
+  echo "Another iGPU reset is already running." >&2
+  exit 1
+fi
+
+exec >>"$log_file" 2>&1
+echo "Started: $(date --iso-8601=seconds)"
+echo "PCI IDs: GPU=$gpu_id audio=${audio_id:-not-configured}"
+echo "Initial drivers: GPU=$gpu_driver audio=$audio_driver"
+
+bind_gpu_to() {
+  local target=$1
+  local current
+  current=$(driver_name "$device")
+
+  if [[ $current != none && $current != "$target" ]]; then
+    printf '%s' "$GPU_BDF" >"$device/driver/unbind"
+  fi
+
+  printf '%s' "$target" >"$device/driver_override"
+  if [[ $(driver_name "$device") == none ]]; then
+    printf '%s' "$GPU_BDF" >/sys/bus/pci/drivers_probe
+  fi
+  udevadm settle
+}
+
+restore_vfio() {
+  set +e
+  echo "Returning $GPU_BDF to vfio-pci..."
+  bind_gpu_to vfio-pci
+  if [[ $(driver_name "$device") == vfio-pci ]]; then
+    echo "Rollback confirmed: driver=vfio-pci"
+  else
+    echo "ERROR: could not return $GPU_BDF to vfio-pci."
+  fi
+}
+trap restore_vfio EXIT
+
+modprobe amdgpu
+bind_gpu_to amdgpu
+
+for _ in $(seq 1 30); do
+  [[ $(driver_name "$device") == amdgpu ]] && break
+  sleep 0.5
+done
+
+if [[ $(driver_name "$device") != amdgpu ]]; then
+  echo "amdgpu did not claim $GPU_BDF."
+  exit 1
+fi
+
+echo "amdgpu claimed $GPU_BDF; settling for ${SETTLE_SECONDS}s..."
+sleep "$SETTLE_SECONDS"
+
+if [[ $(driver_name "$device") != amdgpu ]]; then
+  echo "The iGPU unexpectedly left amdgpu."
+  exit 1
+fi
+
+restore_vfio
+trap - EXIT
+
+if [[ $(driver_name "$device") != vfio-pci ]]; then
+  echo "Final check failed: $GPU_BDF is not using vfio-pci."
+  exit 1
+fi
+
+echo "Finished: $(date --iso-8601=seconds)"
+echo "PASS: preventive reset completed"
