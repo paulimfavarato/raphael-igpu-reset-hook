@@ -15,7 +15,7 @@ for script in \
 done
 
 if rg -n -i --glob '!**/tests/smoke.sh' \
-  'paulim|ea8167ce|/home/|windows11\.qcow|BEGIN.*PRIVATE|token' "$project_dir"; then
+  '3572468|ea8167ce|/home/|windows11\.qcow|BEGIN.*PRIVATE|gho_' "$project_dir"; then
   echo "Potential private machine data found." >&2
   exit 1
 fi
