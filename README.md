@@ -1,5 +1,7 @@
 # Raphael iGPU reset hook for libvirt
 
+[![Shell checks](https://github.com/paulimfavarato/raphael-igpu-reset-hook/actions/workflows/shell.yml/badge.svg)](https://github.com/paulimfavarato/raphael-igpu-reset-hook/actions/workflows/shell.yml)
+
 Experimental workaround for AMD Raphael iGPU passthrough guests that work on
 the first start after a host reboot, but produce a white/corrupted physical
 display and AMD-Vi `IO_PAGE_FAULT` events on later guest starts.
