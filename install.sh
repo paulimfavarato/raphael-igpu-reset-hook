@@ -42,7 +42,8 @@ if [[ ! $settle =~ ^[0-9]+$ ]] || (( settle < 1 || settle > 60 )); then
   exit 2
 fi
 
-readonly source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly source_dir
 readonly helper_dir=/usr/local/libexec/raphael-igpu-reset
 readonly hook_dir=/etc/libvirt/hooks/qemu.d
 readonly config=/etc/raphael-igpu-reset.conf
